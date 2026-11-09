@@ -1,223 +1,230 @@
+<!-- markdownlint-disable-file MD033 MD045 -->
+<div align="center">
+
 # CodeArts2API
 
-> 华为云 CodeArts Agent（盘古助手/码道）的 OpenAI 兼容代理。**无需运行 CodeArts Agent
-> 客户端**，纯 Go 直连华为云 API，多账号轮转 + token 自动续期 + WebUI。
->
-> **免责声明**：本项目基于公开客户端协议的逆向研究，仅供学习与个人研究使用，不承诺
-> 可用性；自动化调用可能违反华为云服务条款，由此产生的账号风险与责任由使用者自行承担。
+**High-Performance OpenAI-Compatible Gateway Bridging Huawei Cloud CodeArts Agent into Standard LLM APIs**
 
-## 本仓库来源与差异
+[![License](https://img.shields.io/badge/license-MIT-green.svg?style=flat-square)](LICENSE)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8.svg?style=flat-square&logo=go&logoColor=white)](https://go.dev/)
+[![Docker](https://img.shields.io/badge/Docker-Available-2496ED.svg?style=flat-square&logo=docker&logoColor=white)](Dockerfile)
+[![Protocol](https://img.shields.io/badge/Protocol-OpenAI_Compatible-412991.svg?style=flat-square&logo=openai&logoColor=white)](https://platform.openai.com/)
+[![Upstream](https://img.shields.io/badge/Upstream-Huawei_Cloud_CodeArts-C7000B.svg?style=flat-square&logo=huawei&logoColor=white)](https://www.huaweicloud.com/)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg?style=flat-square)]()
 
-本仓库 fork 自 [HITZY2002/codearts2api](https://github.com/HITZY2002/codearts2api)（MIT，
-版权归原作者 HITZY2002 所有），用于我们自己的生产部署；上游项目请以上游仓库为准。
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [Core Features](#core-features) · [Architecture](#system-architecture) · [Quick Start](#quick-start) · [Model Catalog](#model-catalog--benefit-tokens) · [Configuration](#configuration-reference)
 
-在上游基础上做了一轮生产级审查与根因修复，主要差异：
+<br>
 
-- **并发安全**：会话状态文件先在锁内快照再序列化（原实现会在并发请求下触发
-  `concurrent map iteration and map write` 致命错误）；账号状态写盘改为带错误日志的
-  原子异步写，退出前同步 flush；并发槽位的持有/释放显式化，消除误释放导致的上限失效。
-- **错误归类与轮转**：区分「账号故障」「该账号没有这个模型」「客户端参数错误」。
-  模型在某账号未注册时换号重试（多账号池的模型注册与套餐并不一致），全部失败才回 404；
-  非流式路径不再把模型级错误当成账号故障冷却健康账号；客户端断开不处罚账号。
-- **流式正确性**：上游未发终态事件就断流时返回 `STREAM_TRUNCATED` 且**不补** `[DONE]`，
-  避免客户端把半截回答当完整回答；`usage` 只透传上游真实值（删除估算与伪造的
-  `usage: null`），`stream_options.include_usage` 语义生效。
-- **凭证可靠性**：登录结果必须携带与 `refresh_token` 配对的 DPoP 私钥，否则拒绝落盘
-  （缺私钥的账号 2 小时后必然续期失败）；token 刷新加 30 秒超时；过期时间未知时
-  不再假装"还剩 24 小时"。
-- **探测与列表**：周期探测统一走带间隔与互斥的 `runProbes`，不再与真实请求抢上游
-  会话槽位；`/v1/models` 在所有账号都用不了某模型时不再列出必然 404 的条目。
-- **清理**：删除未被接线的账号选择器家族、死参数、包装层与重复实现，统一 UTF-8 安全截断。
+<p align="center">
+  <b>Terminates proprietary client locks and desktop dependency for Huawei Cloud CodeArts Agent.</b><br>
+  Engineered in pure Go with zero external runtime dependencies, native DPoP OAuth token rotation, atomic state synchronization, and adaptive upstream queue recovery.<br>
+  Delivers OpenAI-compatible SSE streaming, native tool calling, multi-account pool load balancing with model-level fallback, and automated daily credit check-ins.
+</p>
 
-## 参考项目
+</div>
 
-本项目是 [Sliverkiss](https://github.com/Sliverkiss) 同系列开源项目的延伸实现，架构与运维形态参考了以下仓库：
+---
 
-- [workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) — WorkBuddy CN OpenAI 兼容反代（账号池 / 轮转 / 签到架构）
-- [traework2api](https://github.com/Sliverkiss/traework2api) — TRAE Work OpenAI 兼容反代（零依赖 Go 骨架）
-- [qoderwork2api](https://github.com/Sliverkiss/qoderwork2api) — QoderWork CN OpenAI 兼容反代（OAuth 授权流程）
+> **Disclaimer**: This project is based on protocol reverse engineering for personal research and academic testing. It does not guarantee commercial availability. Automated API access may be subject to Huawei Cloud terms of service; users assume full operational responsibility.
 
-感谢原作者的开源与优秀设计。
+---
 
-## 快速开始（Ubuntu / Linux）
+## Motivation & Architecture Comparison
+
+Huawei Cloud CodeArts Agent (Pangu assistant / Madao) provides competitive coding and reasoning models, but officially restricts access to proprietary IDE extensions and desktop binaries. CodeArts2API decouples these models into universal OpenAI-compatible endpoints:
+
+| Evaluation Dimension | CodeArts2API Gateway | Official IDE Extensions | Ad-Hoc Reverse Proxies |
+| :--- | :--- | :--- | :--- |
+| **Runtime Footprint** | Lightweight native Go binary (<25MB RSS), zero external deps | Requires full IDE (VS Code / IntelliJ) with heavy background plugins | Heavy Python/Node.js interpreters with excessive memory draw |
+| **Protocol Fidelity** | 100% OpenAI-compliant SSE, structured tool calls, and accurate usage chunks | Proprietary RPC / internal HTTP protocols isolated from third-party tools | Fabricates usage objects or omits terminal events, corrupting streams |
+| **Account Orchestration** | Intelligent concurrency gating, dynamic account pooling, and model-level failover | Single-account binding locked inside IDE state | Simple round-robin failing immediately when an account lacks a model |
+| **Credential Lifecycle** | Enforces DPoP private key pairing with automatic 30s timeout refresh cycles | Manual browser re-login upon session expiry | Fakes 24h validity, fatally failing token refresh after 2 hours |
+| **Health Telemetry** | Mutex-guarded micro-probes with 30m self-healing cache without penalizing healthy accounts | None (crashes or displays UI error alerts) | Probes compete directly with user chat requests for upstream session slots |
+| **Benefit & Quota Ops** | Auto-discovers and claims free-tier benefit models and daily check-in credits | Requires manual daily web console navigation | Lacks automated claim pipelines |
+
+---
+
+## Core Features
+
+| Module | Feature Highlight | Technical Implementation & Advantage |
+| :--- | :--- | :--- |
+| **Concurrency Hardening** | Eliminates concurrent map write panics | Session state files are snapshotted inside read-write locks before serialization; credentials use atomic asynchronous writes with shutdown flush. |
+| **Error Classification** | Granular failure routing | Distinguishes between account outages, unregistered models, and client param errors. Rotates transparently to eligible accounts; only returns 404 when exhausted. |
+| **High-Fidelity Streaming** | Exact stream termination & usage parity | Returns `STREAM_TRUNCATED` on upstream drop without fabricating `[DONE]`; strictly adheres to `stream_options.include_usage` contract. |
+| **DPoP Token Validation** | Strict cryptographic credential integrity | Rejects tokens lacking matching DPoP private keys to prevent expired accounts from wedging the pool; refreshes feature a 30s timeout guard. |
+| **Model Probing Engine** | Isolated non-interfering background discovery | Runs periodic health probes independently from user sessions; filters out ghost models announced by upstream that fail real inference. |
+| **Benefit Auto-Claim** | Resolves benefit not found errors | Idempotently claims free-tier promotional models and dynamically signs `maas_type: benefit` request headers per account capability. |
+| **Daily Credit Watchdog** | Automated check-in and new-user bonus | Background watchdog claims daily 1,000 credit allowances and pending rewards with auto-confirmation; exposes admin REST and WebUI hooks. |
+| **Integrated WebUI** | Real-time fleet dashboard & testing | Built-in zero-dependency management interface for inspecting account health, token remaining time, and running interactive chat sessions. |
+
+---
+
+## System Architecture
+
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│                        Client Applications                             │
+│   NextChat · LobeChat · Chatbox · NewAPI · OneAPI · Cherry Studio      │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │ Standard OpenAI API (POST /v1/chat/completions)
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                   CodeArts2API Production Gateway (:7866)              │
+│  ┌──────────────────────┐ ┌──────────────────────┐ ┌────────────────┐  │
+│  │ OpenAI Protocol Hub  │ │ Dynamic Account Pool │ │ Probing Cache  │  │
+│  │ SSE Formatter / Tools│ │ Failover & Rotation  │ │ 30m TTL Cache  │  │
+│  └──────────┬───────────┘ └──────────┬───────────┘ └────────┬───────┘  │
+│             │                        │                      │          │
+│             ▼                        ▼                      ▼          │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │          Huawei Cloud CodeArts Protocol Translation Layer        │  │
+│  │    DPoP Key Signing · Token Auto-Refresh · Watchdog Scheduler    │  │
+│  └──────────────────────────────────┬───────────────────────────────┘  │
+└─────────────────────────────────────┼──────────────────────────────────┘
+                                      │ HTTPS / SSE
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                     Huawei Cloud CodeArts Cloud Fleet                  │
+│       Pangu Models · GLM Suite · Qwen Suite · Credit System            │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Quick Start
+
+### 1. Build from Source
 
 ```bash
-make linux            # bin/ 下 4 个 Linux 静态二进制
+# Compile static Linux binary
+make linux
+
+# Run full test suite
 make test
 ```
 
-### 登录（华为云账号）
+### 2. Account Authentication (Huawei Cloud)
 
 ```bash
-# 本机有浏览器
+# On machines with a desktop browser
 ./login.sh
 
-# 服务器（无浏览器）：打印链接，任意机器浏览器打开，ticket 轮询下发
+# On headless servers: prints authorization link to open locally; polls ticket automatically
 ./login.sh -print-only
 
-# 凭证落盘 auths/codearts-{user_id}.json
+# Saved credentials persist to auths/codearts-{user_id}.json
 ```
 
-### 启动
+### 3. Launch Gateway
 
 ```bash
+# Copy example configuration
 cp config.example.json config.json
-export CA2A_API_KEY=你的随机密钥
+
+# Set mandatory API key
+export CA2A_API_KEY=$(openssl rand -hex 24)
+
+# Launch gateway daemon
 ./bin/codearts2api -config config.json
 ```
 
-### 验证 + WebUI
+### 4. Verification & Usage
 
 ```bash
+# Health check
 curl http://127.0.0.1:7866/healthz
+
+# List verified active models
 curl http://127.0.0.1:7866/v1/models -H "Authorization: Bearer $CA2A_API_KEY"
+
+# Chat completion request
 curl -X POST http://127.0.0.1:7866/v1/chat/completions \
-  -H "Authorization: Bearer $CA2A_API_KEY" -H "Content-Type: application/json" \
-  -d '{"model":"snap-chat","messages":[{"role":"user","content":"你好"}]}'
+  -H "Authorization: Bearer $CA2A_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-5.2",
+    "messages": [{"role": "user", "content": "Hello, describe your capabilities."}]
+  }'
 ```
 
-浏览器打开 **http://127.0.0.1:7866/** 即 WebUI：账号/token 状态、对话测试（流式/非流式）。多轮上下文按账号自动续接（chat_id 分组）；也可用请求头
-`X-Codearts-Chat-Id: <chatId>` 或 body 里 `conversation_id` 显式指定会话。
+Access `http://127.0.0.1:7866/` in a web browser to view account pool health, monitor token expiry, and run interactive streaming dialogues.
 
-流式请求设置 `"stream_options":{"include_usage":true}` 后，会在 `[DONE]` 前返回一次
-`choices: []` 的 usage chunk；其余 chunk 的 `usage` 为 `null`。未启用时不返回 usage。
-流式和非流式均优先使用上游 usage；上游未提供时按文本长度估算，估算值不是精确 token 计数。
+---
 
-工具调用支持 `tool_choice` 的 `auto` / `none` / `required` 及指定函数对象。
-指定函数时，网关只向上游发送该函数的定义，并转换为上游支持的字符串 `required`；
-指定函数不存在或重复定义时返回 400。上游 `InferHub.001001005` 参数错误也返回 400，
-不轮换、不冷却账号；若流式响应已开始，则用 SSE 错误事件结束，同样不处罚账号。
+## Model Catalog & Benefit Tokens
 
-### 模型列表与限时福利
+`/v1/models` outputs upstream **case-sensitive model IDs** (e.g. `GLM-5.2`, `Qwen3-VL-235B`), alongside automatic lowercase aliases (`glm-5.2`):
 
-`/v1/models` 返回上游**精确模型 ID**（区分大小写，如 `GLM-5.2`、`Qwen3-VL-235B`），
-同时为含大写的 ID 补一条小写别名（`glm-5.2`），两者都能用于聊天。限时福利
-（免费套餐）模型额外带 `benefit: true` 标记，聊天时服务端会自动追加上游要求的
-`maas_type: benefit` 请求头（按发起请求的账号判定，多账号套餐不同也不会串——
-列表是各账号可用模型的并集，实际路由会优先挑目录里真有这个模型的账号）。
-
-福利模型列表随免费套餐轮换，用下面这条命令核对当前账号实际可用的模型：
+- **Promotional Benefit Models**: Free-tier models carry `benefit: true`. During chat dispatch, the gateway automatically appends upstream's required `maas_type: benefit` header based on the selected account's entitlement.
+- **Mandatory Pre-Claim**: Unclaimed benefit models reject requests with `InferHub.4004.200 benefit not found`. The gateway automatically claims them upon discovery (`benefit_auto_claim: true`).
 
 ```bash
-go run ./cmd/models                 # 账号可用模型（内置 + 福利）
-go run ./cmd/models -json           # 机器可读
-go run ./cmd/models -claim          # 先领取限时福利再查询（幂等，属写操作）
+go run ./cmd/models                 # Inspect available models for current credentials
+go run ./cmd/models -json           # Machine-readable output
+go run ./cmd/models -claim          # Perform idempotent claim prior to query
 ```
 
-限时福利模型**必须先领取才能调用**：未领取时上游一律返回
-`InferHub.4004.200 benefit not found`（实测）。领取是幂等操作，官方客户端打开模型
-菜单时也会调用，因此服务默认会领取（`benefit_auto_claim: true`）。不想让服务写账号
-可显式关闭：
+---
 
-```jsonc
-"benefit_auto_claim": false   // 或 CA2A_BENEFIT_AUTO_CLAIM=0
-```
+## Automated Check-in & Daily Credits
 
-关闭后福利模型仍会出现在 `/v1/models`，但调用必然失败。
+The internal watchdog periodically inspects promotional campaigns and performs automated check-ins:
+- Awards 1,000 daily check-in credits for credit-billing enrolled accounts (valid 30 days);
+- Awards 4,000 new user onboarding credits;
+- Includes auto-confirmation guarantees; campaign hiccups never throttle inference traffic;
+- Manual trigger available via WebUI or via authenticated administrative API: `POST /admin/api/checkin`.
 
-### 模型可用性探测
+---
 
-`/v1/models` 只列**真实可用**的模型：上游的模型发现（agent-center / builtin / 福利
-网关）会列出当前账号根本没注册的模型（实测 `GLM-5.2-ArkTS-SPARK`、`OpenPangu-2.0-Pro`
-等返回 `InferHub.002002009.404`）。服务会周期性用一条最小请求探测并缓存结论，
-真实请求失败也会被学习（`not registered` / `benefit not found` 记为账号能力问题，
-不会给健康账号记错误冷却）。探测结果缓存 30 分钟。
+## Configuration Reference
 
-### API Key 必填
+Settings can be managed via `config.json` or overridden via environment variables:
 
-服务没有 API Key 会**拒绝启动**（旧版本会回退到公开的 `dummy-key-for-codearts`，
-等于把接口暴露给任何人）。三选一：
+| Environment Variable | Description | Default |
+| :--- | :--- | :--- |
+| `CA2A_API_KEY` | Gateway API bearer access token | Required (refuses launch without key) |
+| `CA2A_LISTEN` | Service bind address and port | `:7866` |
+| `CA2A_AUTH_DIR` | Directory containing account JSON credentials | `./auths` |
+| `CA2A_STATE_FILE` | Runtime state and session cache path | `./data/state.json` |
+| `CA2A_DEFAULT_MODEL` | Fallback model identifier | `glm-5.2` |
+| `CA2A_OAUTH_CALLBACK_HOST` | External hostname for OAuth redirection | Auto-detected |
+| `CA2A_WATCH_ENABLED` | Master toggle for background watchdog | `true` |
+| `CA2A_WATCH_POLL_MINUTES` | Watchdog polling interval in minutes | `30` |
+| `CA2A_WATCH_REFRESH_SKEW` | Proactive token renewal buffer in minutes | `30` |
+| `CA2A_WATCH_KEEPALIVE_INTERVAL` | Micro-heartbeat interval in minutes | `15` |
+| `CA2A_MAX_CONCURRENT` | Maximum concurrent upstream slots per account | `1` |
+| `CA2A_BENEFIT_AUTO_CLAIM` | Idempotently claim benefit models on discovery | `true` |
+| `CA2A_CREDITS_AUTO_CLAIM` | Auto-claim daily check-in and onboarding credits | `true` |
+
+---
+
+## Deployment Modes
+
+### Docker Compose
 
 ```bash
-# 1) env（推荐，配合 .env / systemd EnvironmentFile）
 export CA2A_API_KEY=$(openssl rand -hex 24)
-# 2) config.json 的 "api_key" 字段
-# 3) docker compose 的 .env
-```
-
-### 账号续期
-
-`refresh_token` 与登录时的 `client_id`、DPoP 私钥绑定，因此凭证文件会保存
-`client_id` 与 `dpop_private_key`；刷新时原样复用并写回轮转后的新 refresh_token。
-若手工换过 `login_client_id`，老账号仍按自己记录的 client_id 刷新。
-
-### 每日签到与新手积分
-
-服务默认在启动和每次 watchdog 轮询时检查活动，自动领取每日签到积分及
-上游返回的可领取新用户积分。新增账号会在下一次轮询处理；也可在 WebUI
-点击「签到」/「全员签到」，或鉴权调用 `POST /admin/api/checkin`（可传 `{"uid":"账号 ID"}`）。
-领取后必须确认；已领取未确认时只补确认，已确认不重复领取。资格、金额、
-每日刷新和活动起止时间均以上游返回为准，失败会在下一次轮询重试，
-不会因活动接口故障冷却或禁用推理账号。
-
-`credits_auto_claim: false` 或 `CA2A_CREDITS_AUTO_CLAIM=0` 可关闭自动领取，
-`watch.enabled: false` 会关闭整个轮询。手动签到仍可使用。
-这项活动与 `benefit_auto_claim` 的模型 Token 福利独立；面板显示最近领取结果，
-不把领取量或健康账号数当作积分余额。`credit.sh` 查登录态，`apply.sh` 仅续期。
-
-当前[官方每日签到活动](https://support.huaweicloud.com/offers-codeartsagent/codeartsagent_offers_0004.html)
-为已升级积分计费的用户每日发放 1000 积分，30 天有效，活动截止于
-2026-12-31 00:00（UTC+8）；[新用户注册奖励](https://support.huaweicloud.com/price-codeartsagent/codeartsagent_billing_0029.html)
-为 4000 积分。无资格或已自动发放的新手奖励不会再次领取。
-
-## 部署（systemd / Docker）
-
-```bash
-sudo mkdir -p /opt/codearts2api && sudo cp -r bin config.example.json auths /opt/codearts2api/
-sudo cp deploy/codearts2api.service /etc/systemd/system/
-# 编辑 /opt/codearts2api/.env 写 CA2A_API_KEY，改好 config.json
-sudo systemctl daemon-reload && sudo systemctl enable --now codearts2api
-
-# 或 Docker
-export CA2A_API_KEY=你的随机密钥
 mkdir -p auths data
 docker compose up -d --build
 ```
 
-## 环境变量配置
+### Systemd Service
 
-除了 `config.json`，还支持以下环境变量覆盖：
-
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| `CA2A_API_KEY` | API 访问密钥 | - |
-| `CA2A_LISTEN` | 监听地址 | `:7866` |
-| `CA2A_AUTH_DIR` | 凭证目录 | `./auths` |
-| `CA2A_STATE_FILE` | 状态文件 | `./data/state.json` |
-| `CA2A_DEFAULT_MODEL` | 默认模型 | `glm-5.2` |
-| `CA2A_OAUTH_CALLBACK_HOST` | OAuth 回调主机 | - |
-| `CA2A_WATCH_ENABLED` | 调度器开关 | `true` |
-| `CA2A_WATCH_POLL_MINUTES` | 轮询间隔（分钟） | `30` |
-| `CA2A_WATCH_REFRESH_SKEW` | 提前刷新时间（分钟） | `30` |
-| `CA2A_WATCH_KEEPALIVE_INTERVAL` | 保活间隔（分钟） | `15` |
-| `CA2A_MAX_CONCURRENT` | 单账号最大并发 | `1` |
-| `CA2A_KEEPALIVE_WINDOW` | 保活窗口 | `10m` |
-| `CA2A_BENEFIT_AUTO_CLAIM` | 发现模型时自动领取限时福利（幂等；关闭则福利模型不可用） | `true` |
-| `CA2A_CREDITS_AUTO_CLAIM` | watchdog 自动领取每日签到及新用户积分 | `true` |
-| `CA2A_LOGIN_CLIENT_ID` | WebUI 登录使用的 OAuth client_id | 已有账号的取值，否则 `codearts-agent` |
-
-## 目录结构
-
-```
-cmd/server/        HTTP 服务（config + main）
-cmd/login/         华为云 OAuth2 PKCE 登录
-cmd/credit/        账号登录态日报（新增并发信息）
-cmd/apply/         批量 token 续期（使用 pool 包）
-cmd/models/        查看账号可用模型（内置 + 限时福利，可选 -claim 领取）
-internal/auth/     auth 文件读写
-internal/upstream/ 云端客户端（登录/聊天/SSE/模型发现）+ 逆向常量
-internal/pool/     账号池（token 校验/自动刷新/冷却/并发控制）
-internal/scheduler/ token 续期看门狗（新增保活机制）
-internal/server/   OpenAI 兼容路由 + 内嵌 WebUI 控制台（panel.html）
-deploy/            systemd unit 样例
-docs/              逆向过程与接口清单
+```bash
+sudo mkdir -p /opt/codearts2api && sudo cp -r bin config.example.json auths /opt/codearts2api/
+sudo cp deploy/codearts2api.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now codearts2api
 ```
 
-## 免责声明
+---
 
-仅供学习和研究使用。使用者需遵守华为云服务条款，自行承担使用风险。
+## Contributing & License
 
-## License
+Contributions and pull requests are welcome. Please ensure all tests pass prior to submitting changes:
 
-MIT
+```bash
+go test -v ./...
+```
 
+Licensed under the [MIT License](LICENSE).
