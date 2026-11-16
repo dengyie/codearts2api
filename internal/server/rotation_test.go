@@ -13,8 +13,9 @@ import (
 	"codearts2api/internal/upstream"
 )
 
-// 多账号池里模型注册/套餐并不一致：第一个账号说「没这个模型」时必须换号重试，
-// 而不是直接给客户端 404。删除目录选择器后，轮转本身就是能力探测。
+// 多账号池里模型注册/套餐并不一致：第一个账号说「没这个模型」时必须先在同账号
+// 上试两种大小写拼法（ee754d8：大小写不匹配会被伪装成未注册/无权），两种都失败
+// 才换号重试，而不是直接给客户端 404。删除目录选择器后，轮转本身就是能力探测。
 func TestModelUnavailableRotatesToAccountThatHasIt(t *testing.T) {
 	const notRegistered = "data: {\"text\":\"[DONE]\",\"error_code\":\"InferHub.002002009.404\",\"error_msg\":\"The model is not registered, please request other model\"}\n\n"
 	const okStream = "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"

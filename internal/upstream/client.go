@@ -447,6 +447,15 @@ var (
 	workingModels = map[string]string{} // lower(id) -> working exact case
 )
 
+// ResetWorkingModelsForTest 清空全局 workingModels（仅供测试隔离使用：
+// 测试进程内多个用例共享该全局表，不重置会让上一个用例学到的拼法污染
+// 下一个用例的「全新模型」假设）。
+func ResetWorkingModelsForTest() {
+	workingMu.Lock()
+	workingModels = map[string]string{}
+	workingMu.Unlock()
+}
+
 // RecordWorkingModel 记录运行时验证可用的大小写映射。
 func RecordWorkingModel(requested, working string) {
 	if working == "" {
@@ -690,6 +699,10 @@ func (c *Client) sendModelChatV2(ctx context.Context, body map[string]any, model
 	rc, retryErr := c.sendChatV2(ctx, body, traceID, cred, cred.SecurityToken, chatID, sessionID, benefit)
 	if retryErr == nil {
 		c.chatModelIDs.Store(key, alternate)
+		// 同步写入全局 workingModels 层（CanonicalModel 第 2 优先级）：
+		// chatModelIDs 是每账号会话内缓存，workingModels 跨账号/跨探测共享，
+		// 两层不同步会让 /v1/models 与 probe 用过时拼法。幂等，重复记录无害。
+		RecordWorkingModel(model, alternate)
 	} else if IsModelAccessErrorMessage(err.Error()) && isModelIDError(retryErr.Error()) {
 		// An unregistered alternate spelling does not resolve the original denial.
 		return nil, err

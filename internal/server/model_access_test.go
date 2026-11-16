@@ -143,6 +143,7 @@ func TestModelAccessDeniedAfterContent(t *testing.T) {
 
 func modelAccessTestHandler(t *testing.T, endpoint string, paths ...string) (*Handler, *pool.Pool) {
 	t.Helper()
+	upstream.ResetWorkingModelsForTest() // 全局学习表跨用例隔离
 	var auths []*auth.Auth
 	accountPrefix := t.Name() + "-" + randHex(16)
 	for _, path := range paths {

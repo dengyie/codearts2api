@@ -809,6 +809,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if modelDenied {
+				// 双终态信号：lastErr 供 attempted&&modelOnlyFailure 404 携带详情，
+				// modelAccessErr 是上游 ee754d8 的专用信号（两者并存，前者总先命中）。
 				modelAccessErr = serr
 				stickyAcct = ""
 				attempted = true
