@@ -633,7 +633,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tried := map[string]bool{}
+	// ee754d8：已知「账号×模型」模型级拒绝的组合直接标记为已尝试，
+	// 不再浪费轮转与上游调用（账号可用性保护的前半段）。
+	for _, acct := range h.cfg.Pool.Accounts() {
+		if st, reason := modelAvailability(acct.UID, model); st == availUnusable && reason == modelAccessDeniedReason {
+			tried[acct.Name] = true
+		}
+	}
+	if tried[stickyAcct] {
+		stickyAcct = ""
+	}
 	var lastErr error
+	var modelAccessErr error // ee754d8：所有账号都在模型级拒绝时的终态 404 依据
 	// attempted/modelOnlyFailure：区分「试过但每个账号都说没这个模型」（→404）
 	// 与「账号整体不可用」（→503）。删除目录选择器后，轮转本身就是能力探测：
 	// 只有所有被尝试的账号都返回 model-unavailable 才算模型不可用。
@@ -761,22 +772,48 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			break // 非并发错误，跳出重试
 		}
+		// ee754d8：聚合阶段错误统一并入 serr 分类——聚合中暴露的模型级拒绝
+		// 同样走 markUnusable（账号可用性保护）而不是账号冷却。
+		var comp *upstream.RawCompletion
+		readCompletion := serr == nil && !req.Stream
+		if readCompletion {
+			comp, serr = upstream.AggregateRaw(rc)
+			rc.Close()
+		}
 		if serr != nil {
 			// 若上游返回 4004.200 (benefit not found) 且带了福利头：2026-10 架构下线了福利网关，
-			// 去掉 maas_type: benefit 立即在当前账号重试一次。
+			// 去掉 maas_type: benefit 立即在当前账号重试一次。重试产生全新流；
+			// 非流式路径需对新流重新聚合。
 			if benefit && (strings.Contains(serr.Error(), "4004.200") || strings.Contains(serr.Error(), "benefit not found")) {
 				log.Printf("upstream benefit not found for model %s account=%s: retrying without benefit header", model, acct.Name)
 				benefit = false
 				rc, serr = acct.Client.ChatStreamWithOptions(r.Context(), chatID, msgs, "", cred, acct.UserName, model, chatOpts, false)
+				if serr == nil && !req.Stream {
+					comp, serr = upstream.AggregateRaw(rc)
+					rc.Close()
+				}
 			}
 		}
 		if serr != nil {
+			modelDenied := upstreamUnavailableReason(serr) == modelAccessDeniedReason
+			if modelDenied {
+				// ee754d8 账号可用性保护：模型级拒绝只标记「账号×模型」不可用，
+				// 不冷却账号、不计 NoteError——账号对其他模型依然健康。
+				markUnusable(acct.UID, model, modelAccessDeniedReason)
+			}
 			release() // 释放槽位再换号
 			if isClientGone(r, serr) {
 				// 客户端在连接/首帧阶段就断开了（用户点停止、网关超时）：
 				// 上游错误只是 context canceled 的转述，不是账号故障。
 				log.Printf("chat stream account=%s aborted by client: %v", acct.Name, serr)
 				return
+			}
+			if modelDenied {
+				modelAccessErr = serr
+				stickyAcct = ""
+				attempted = true
+				lastErr = serr
+				continue
 			}
 			lastErr = serr
 			switch h.handleUpstreamError(acct, model, serr) {
@@ -795,6 +832,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			attempted = true
 			modelOnlyFailure = false
 			continue
+		}
+		// 非流式：聚合已完成后释放槽位（流式在 StreamCapture 之后释放，
+		// 期间必须持锁以保证并发上限语义；release() 闭包幂等防重放）。
+		if readCompletion {
+			release()
 		}
 		// 真实调用成功：记下「这个账号能用这个模型」，供 /v1/models 过滤参考。
 		markUsable(acct.UID, model)
@@ -829,6 +871,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 					log.Printf("chat stream account=%s aborted by client", acct.Name)
 				case isParamInvalidError(werr):
 					// 客户端参数问题：换号也是同样 400。
+				case upstreamUnavailableReason(werr) == modelAccessDeniedReason:
+					// ee754d8：流中模型级拒绝同样只标记可用性，不动账号。
+					markUnusable(acct.UID, model, modelAccessDeniedReason)
 				default:
 					h.cfg.Pool.NoteError(acct.Name, h.cfg.ErrThreshold, h.cfg.ErrCooldown)
 				}
@@ -836,32 +881,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				h.cfg.Pool.NoteSuccess(acct.Name)
 			}
 			return
-		}
-
-		comp, aerr := upstream.AggregateRaw(rc)
-		rc.Close()
-		release()
-		if aerr != nil {
-			if isClientGone(r, aerr) {
-				// 客户端已断开：响应无处可写，更重要的是不能因此冷却健康账号。
-				log.Printf("chat account=%s aborted by client: %v", acct.Name, aerr)
-				return
-			}
-			lastErr = aerr
-			// 统一走错误分类：此前这里无条件 Cooldown，把「模型未注册」这类
-			// 账号能力问题当成账号故障，健康账号被冷却 10 分钟。
-			switch h.handleUpstreamError(acct, model, aerr) {
-			case errClientParam:
-				writeOpenAIError(w, http.StatusBadRequest, "invalid_request",
-					"upstream rejected request params: "+truncateMsg(aerr.Error(), 200))
-				return
-			case errModelUnavailable:
-				attempted = true
-				continue
-			}
-			attempted = true
-			modelOnlyFailure = false
-			continue
 		}
 
 		content, finish := comp.Content, comp.Finish
@@ -895,13 +914,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusNotFound, "model_not_available", msg)
 		return
 	}
+	if lastErr == nil && modelAccessErr != nil {
+		// ee754d8：全部账号模型级拒绝且无账号级错误时，直接 404 而非 503。
+		writeOpenAIError(w, http.StatusNotFound, "model_not_available",
+			"model "+model+" is not available: "+truncateMsg(modelAccessErr.Error(), 200))
+		return
+	}
 	msg := "all accounts unavailable (disabled/cooldown)"
 	if lastErr != nil {
 		msg += ": " + lastErr.Error()
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }
-
 // buildUpstreamMessages 把 OpenAI 消息原生映射为 CodeArts V2 chat-completions。
 // Chat-Id/Session-Id 只做亲和与缓存；多轮语义仍由完整 messages 承载。
 // 工具 schema 由 ChatOptions 原生传递，因此这里不需要 toolsOn 分支。

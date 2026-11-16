@@ -45,8 +45,10 @@ func TestModelUnavailableRotatesToAccountThatHasIt(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `"content":"OK"`) {
 		t.Fatalf("body=%s", rec.Body.String())
 	}
-	if len(hits) != 2 || hits[0] != "tok-a" || hits[1] != "tok-b" {
-		t.Errorf("应先试 a 再换 b，got=%v", hits)
+	// ee754d8 语义：模型不可用先在同账号上试两种大小写拼法（大小写不匹配会被
+	// 上游伪装成模型未注册/无权），两种都失败才轮转到下一账号。
+	if len(hits) != 3 || hits[0] != "tok-a" || hits[1] != "tok-a" || hits[2] != "tok-b" {
+		t.Errorf("应先在 a 上试两种拼法再换 b，got=%v", hits)
 	}
 	// 能力问题不是账号故障：a 必须仍然健康，只记「这个账号没有该模型」。
 	if !p.Healthy("acct-a") {
