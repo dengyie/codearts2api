@@ -928,6 +928,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account", msg)
 }
+
 // buildUpstreamMessages 把 OpenAI 消息原生映射为 CodeArts V2 chat-completions。
 // Chat-Id/Session-Id 只做亲和与缓存；多轮语义仍由完整 messages 承载。
 // 工具 schema 由 ChatOptions 原生传递，因此这里不需要 toolsOn 分支。
